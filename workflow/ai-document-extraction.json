@@ -1,0 +1,584 @@
+{
+  "name": "AI Document Extraction Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "node-gmail-poll",
+      "name": "Gmail Poll Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "notes": "Checks Gmail for new invoice emails every 5 minutes"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "node-drive-poll",
+      "name": "Drive Poll Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "notes": "Checks Google Drive folder for new uploaded files"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition"
+      },
+      "id": "node-merge-sources",
+      "name": "Merge Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [300, 150],
+      "notes": "Combines Gmail and Drive ingestion streams"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fileUrl }}",
+        "responseFormat": "file",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "node-download",
+      "name": "Download Attachment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 150],
+      "notes": "Downloads the file from source"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            {
+              "operation": "regex",
+              "value1": "={{ $binary.data.mimeType }}",
+              "value2": "(pdf|png|jpe?g)"
+            }
+          ]
+        },
+        "fallbackOutput": 1
+      },
+      "id": "node-format-check",
+      "name": "Format Check",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [740, 150],
+      "notes": "Routes supported vs unsupported file types"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"model\": \"gpt-4o\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a document extraction specialist. Extract all invoice fields from the provided document image. Return structured JSON with: invoice_number, vendor_name, vendor_email, invoice_date, due_date, subtotal, tax_amount, total_amount, currency, payment_terms, po_number, line_items (array of {description, quantity, unit_price, total}), and confidence (0-1). If a field is not found, use null.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"image_url\",\n          \"image_url\": {\n            \"url\": \"data:{{ $binary.data.mimeType }};base64,{{ $binary.data.data }}\"\n          }\n        }\n      ]\n    }\n  ],\n  \"max_tokens\": 4096,\n  \"temperature\": 0.1,\n  \"response_format\": { \"type\": \"json_object\" }\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "node-openai-extract",
+      "name": "OpenAI Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 80],
+      "notes": "GPT-4o structured extraction with vision",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ JSON.parse($json.choices[0].message.content) }}",
+        "options": {}
+      },
+      "id": "node-parse-response",
+      "name": "Parse Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1180, 80],
+      "notes": "Parses OpenAI JSON response into fields"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n  let valid = true;\n  let flags = [];\n  \n  // Checksum: line_items sum should match subtotal\n  if (data.line_items && data.line_items.length > 0) {\n    const itemsSum = data.line_items.reduce((sum, li) => sum + (li.total || 0), 0);\n    const diff = Math.abs(itemsSum - (data.subtotal || 0));\n    if (diff > 0.01) {\n      valid = false;\n      flags.push('AMOUNT_MISMATCH');\n    }\n  }\n  \n  // Check required fields\n  if (!data.vendor_name) {\n    valid = false;\n    flags.push('MISSING_VENDOR');\n  }\n  \n  if (!data.invoice_number) {\n    valid = false;\n    flags.push('MISSING_INVOICE_NUMBER');\n  }\n  \n  // Check future dates\n  if (data.invoice_date && new Date(data.invoice_date) > new Date()) {\n    flags.push('FUTURE_DATE');\n  }\n  \n  // Adjust confidence if validation failed\n  if (flags.length > 0 && data.confidence >= 0.85) {\n    data.confidence = 0.75;\n  }\n  \n  results.push({\n    json: {\n      ...data,\n      validation: {\n        valid,\n        flags,\n        checked_at: new Date().toISOString()\n      }\n    },\n    binary: item.binary\n  });\n}\n\nreturn results;"
+      },
+      "id": "node-validation",
+      "name": "Validation Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 80],
+      "notes": "Runs checksum, required field, and date validation"
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "sheetName": "={{ $env.GOOGLE_SHEETS_SHEET_NAME || 'Invoices' }}",
+        "filters": {
+          "conditions": [
+            {
+              "column": "A",
+              "condition": "equals",
+              "value": "={{ $json.invoice_number }}"
+            }
+          ]
+        }
+      },
+      "id": "node-duplicate-check",
+      "name": "Duplicate Check",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1620, 80],
+      "notes": "Checks if invoice_number already exists in sheet"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            {
+              "label": "auto-insert",
+              "value": "auto-insert",
+              "operation": "and",
+              "conditions": [
+                {
+                  "leftValue": "={{ $json.confidence }}",
+                  "rightValue": 0.85,
+                  "operator": {
+                    "type": "number",
+                    "operation": "gte"
+                  }
+                },
+                {
+                  "leftValue": "={{ $json.validation.valid }}",
+                  "rightValue": true,
+                  "operator": {
+                    "type": "boolean",
+                    "operation": "equals"
+                  }
+                }
+              ]
+            },
+            {
+              "label": "review",
+              "value": "review",
+              "operation": "and",
+              "conditions": [
+                {
+                  "leftValue": "={{ $json.confidence }}",
+                  "rightValue": 0.5,
+                  "operator": {
+                    "type": "number",
+                    "operation": "gte"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "fallbackOutput": 2
+      },
+      "id": "node-confidence-route",
+      "name": "Confidence Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1840, 80],
+      "notes": "Routes: ≥0.85 valid → auto-insert, ≥0.5 → review, <0.5 → reject"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_SPREADSHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": "={{ $env.GOOGLE_SHEETS_SHEET_NAME || 'Invoices' }}",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoice_number": "={{ $json.invoice_number }}",
+            "vendor_name": "={{ $json.vendor_name }}",
+            "vendor_email": "={{ $json.vendor_email }}",
+            "invoice_date": "={{ $json.invoice_date }}",
+            "due_date": "={{ $json.due_date }}",
+            "subtotal": "={{ $json.subtotal }}",
+            "tax_amount": "={{ $json.tax_amount }}",
+            "total_amount": "={{ $json.total_amount }}",
+            "currency": "={{ $json.currency }}",
+            "payment_terms": "={{ $json.payment_terms }}",
+            "po_number": "={{ $json.po_number }}",
+            "line_items": "={{ JSON.stringify($json.line_items) }}",
+            "confidence": "={{ $json.confidence }}",
+            "processed_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-sheets-insert",
+      "name": "Insert to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2100, 0],
+      "notes": "Appends validated extraction to Google Sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "webhook": "={{ $env.SLACK_REVIEW_WEBHOOK }}",
+        "text": "📋 *Document Review Required*\n*Invoice:* {{ $json.invoice_number || 'Unknown' }}\n*Vendor:* {{ $json.vendor_name || 'Unknown' }}\n*Amount:* {{ $json.currency }} {{ $json.total_amount || 'N/A' }}\n*Confidence:* {{ Math.round(($json.confidence || 0) * 100) }}%\n*Flags:* {{ ($json.validation?.flags || []).join(', ') || 'None' }}\n*Action:* Extracted data needs manual verification before insertion.",
+        "otherFields": {
+          "fields": [
+            {
+              "name": "mrkdwn",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "id": "node-slack-review",
+      "name": "Route to Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2100, 200],
+      "notes": "Sends low-confidence extraction to Slack review queue"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_SPREADSHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": "ProcessingLog",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoice_number": "={{ $json.invoice_number || 'N/A' }}",
+            "status": "={{ $json.confidence >= 0.85 && $json.validation.valid ? 'auto_inserted' : $json.confidence >= 0.5 ? 'review_queued' : 'rejected' }}",
+            "confidence": "={{ $json.confidence }}",
+            "flags": "={{ ($json.validation?.flags || []).join(',') }}",
+            "timestamp": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-log-processing",
+      "name": "Log Processing",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2100, 400],
+      "notes": "Logs every extraction attempt for audit trail"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_REVIEW_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "🚫 *Document Rejected*\nConfidence below 50% — unable to extract meaningful data.\n*File:* {{ $json.fileName || 'Unknown' }}\n*Timestamp:* {{ $now.toISO() }}",
+        "options": {}
+      },
+      "id": "node-reject-notify",
+      "name": "Reject Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2100, 600],
+      "notes": "Notifies when confidence is too low to process"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-daily-summary-trigger",
+      "name": "Daily Summary Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 600],
+      "notes": "Triggers daily at 9 AM"
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_SPREADSHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": "ProcessingLog",
+        "options": {
+          "filters": {
+            "conditions": [
+              {
+                "column": "timestamp",
+                "condition": "today"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-read-today-logs",
+      "name": "Read Today's Logs",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [300, 600],
+      "notes": "Fetches today's processing log entries"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsCode": "const rows = $input.all();\nconst total = rows.length;\nconst inserted = rows.filter(r => r.json.status === 'auto_inserted').length;\nconst reviewed = rows.filter(r => r.json.status === 'review_queued').length;\nconst rejected = rows.filter(r => r.json.status === 'rejected').length;\nconst avgConfidence = total > 0 ? rows.reduce((s, r) => s + (r.json.confidence || 0), 0) / total : 0;\n\nreturn [{\n  json: {\n    date: new Date().toISOString().split('T')[0],\n    total_processed: total,\n    auto_inserted: inserted,\n    review_queued: reviewed,\n    rejected: rejected,\n    success_rate: total > 0 ? Math.round((inserted / total) * 100) : 0,\n    avg_confidence: Math.round(avgConfidence * 100),\n    pending_reviews: reviewed\n  }\n}];"
+      },
+      "id": "node-calculate-summary",
+      "name": "Calculate Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 600],
+      "notes": "Computes daily processing statistics"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_REVIEW_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "📊 *Daily Document Processing Summary — {{ $json.date }}*\n\n• Total Processed: {{ $json.total_processed }}\n• Auto-Inserted: {{ $json.auto_inserted }} ({{ $json.success_rate }}%)\n• Pending Review: {{ $json.pending_reviews }}\n• Rejected: {{ $json.rejected }}\n• Avg Confidence: {{ $json.avg_confidence }}%\n\n{{ $json.pending_reviews > 0 ? '⚠️ There are items waiting for review.' : '✅ All items processed.' }}",
+        "options": {}
+      },
+      "id": "node-send-summary",
+      "name": "Send Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 600],
+      "notes": "Posts daily summary to Slack channel"
+    }
+  ],
+  "connections": {
+    "Gmail Poll Trigger": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive Poll Trigger": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Sources": {
+      "main": [
+        [
+          {
+            "node": "Download Attachment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Attachment": {
+      "main": [
+        [
+          {
+            "node": "Format Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Check": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Extract",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Extract": {
+      "main": [
+        [
+          {
+            "node": "Parse Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Response": {
+      "main": [
+        [
+          {
+            "node": "Validation Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validation Engine": {
+      "main": [
+        [
+          {
+            "node": "Duplicate Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate Check": {
+      "main": [
+        [
+          {
+            "node": "Confidence Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Router": {
+      "main": [
+        [
+          {
+            "node": "Insert to Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route to Review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert to Sheets": {
+      "main": [
+        [
+          {
+            "node": "Log Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route to Review": {
+      "main": [
+        [
+          {
+            "node": "Log Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Summary Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Today's Logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Today's Logs": {
+      "main": [
+        [
+          {
+            "node": "Calculate Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Summary": {
+      "main": [
+        [
+          {
+            "node": "Send Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

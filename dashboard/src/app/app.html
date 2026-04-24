@@ -1,0 +1,131 @@
+<div class="min-h-screen bg-gray-950 text-gray-100">
+  <!-- Header -->
+  <header class="border-b border-gray-800 bg-gray-900/50 backdrop-blur-sm sticky top-0 z-10">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="text-xl">📄</span>
+        <h1 class="text-xl font-semibold text-white">AI Document Extraction</h1>
+        <span class="text-xs text-gray-500">OpenAI GPT-4o → Google Sheets</span>
+      </div>
+      <div class="flex items-center gap-4 text-sm text-gray-400">
+        <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Pipeline Active</span>
+        <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-blue-400"></span> Sheets Connected</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="max-w-7xl mx-auto px-6 py-6">
+    <!-- Stats Row -->
+    <div class="grid grid-cols-5 gap-4 mb-6">
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-sm text-gray-500 mb-1">Total Processed</div>
+        <div class="text-2xl font-bold text-white">{{ totalProcessed() }}</div>
+      </div>
+      <div class="bg-gray-900 border border-emerald-500/30 rounded-lg p-4">
+        <div class="text-sm text-emerald-400/70 mb-1">Auto-Inserted</div>
+        <div class="text-2xl font-bold text-emerald-400">{{ autoInsertedCount() }}</div>
+      </div>
+      <div class="bg-gray-900 border border-amber-500/30 rounded-lg p-4">
+        <div class="text-sm text-amber-400/70 mb-1">Pending Review</div>
+        <div class="text-2xl font-bold text-amber-400">{{ reviewCount() }}</div>
+      </div>
+      <div class="bg-gray-900 border border-red-500/30 rounded-lg p-4">
+        <div class="text-sm text-red-400/70 mb-1">Rejected</div>
+        <div class="text-2xl font-bold text-red-400">{{ rejectedCount() }}</div>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-sm text-gray-500 mb-1">Avg Confidence</div>
+        <div class="text-2xl font-bold text-purple-400">{{ avgConfidence() }}%</div>
+      </div>
+    </div>
+
+    <!-- Confidence Distribution Bar -->
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+      <div class="text-sm text-gray-400 mb-3">Confidence Distribution</div>
+      <div class="flex gap-1 h-3 rounded-full overflow-hidden bg-gray-800">
+        @for (inv of invoices(); track inv.id) {
+          <div class="transition-all duration-300"
+            [ngClass]="getConfidenceColor(inv.confidence)"
+            [style.width.%]="100 / invoices().length"
+            [title]="inv.invoiceNumber + ' — ' + Math.round(inv.confidence * 100) + '%'">
+          </div>
+        }
+      </div>
+      <div class="flex justify-between text-xs text-gray-500 mt-2">
+        <span>0% (rejected)</span>
+        <span>50% (review threshold)</span>
+        <span>85% (auto-insert threshold)</span>
+        <span>100%</span>
+      </div>
+    </div>
+
+    <!-- Tab Filters -->
+    <div class="flex gap-1 mb-4 bg-gray-900 rounded-lg p-1 w-fit">
+      @for (tab of ['all', 'inserted', 'review', 'rejected']; track tab) {
+        <button (click)="setTab(tab as any)"
+          [class]="activeTab() === tab ? 'bg-gray-700 text-white px-4 py-2 rounded-md text-sm font-medium' : 'text-gray-400 px-4 py-2 rounded-md text-sm font-medium hover:text-white'">
+          {{ tab === 'all' ? 'All Documents' : tab === 'inserted' ? '✅ Auto-Inserted' : tab === 'review' ? '🔍 Review Queue' : '❌ Rejected' }}
+        </button>
+      }
+    </div>
+
+    <!-- Invoice Table -->
+    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-gray-800 text-gray-500 text-left">
+            <th class="px-4 py-3 font-medium">Invoice</th>
+            <th class="px-4 py-3 font-medium">Vendor</th>
+            <th class="px-4 py-3 font-medium">Amount</th>
+            <th class="px-4 py-3 font-medium">Confidence</th>
+            <th class="px-4 py-3 font-medium">Status</th>
+            <th class="px-4 py-3 font-medium">Processed</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (inv of filteredInvoices(); track inv.id) {
+            <tr class="border-b border-gray-800/50 hover:bg-gray-800/50 transition-colors">
+              <td class="px-4 py-3">
+                <div class="font-medium text-white">{{ inv.invoiceNumber || '—' }}</div>
+                <div class="text-xs text-gray-500">{{ inv.fileName }}</div>
+              </td>
+              <td class="px-4 py-3 text-gray-300">{{ inv.vendorName || '—' }}</td>
+              <td class="px-4 py-3">
+                <span class="text-white">{{ inv.totalAmount > 0 ? formatAmount(inv.totalAmount, inv.currency) : '—' }}</span>
+                @if (inv.lineItemCount > 0) {
+                  <span class="text-xs text-gray-500 ml-1">({{ inv.lineItemCount }} items)</span>
+                }
+              </td>
+              <td class="px-4 py-3">
+                <div class="flex items-center gap-2">
+                  <div class="w-16 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                    <div class="h-full rounded-full transition-all"
+                      [ngClass]="inv.confidence >= 0.85 ? 'bg-emerald-400' : inv.confidence >= 0.5 ? 'bg-amber-400' : 'bg-red-400'"
+                      [style.width.%]="inv.confidence * 100">
+                    </div>
+                  </div>
+                  <span [class]="getConfidenceColor(inv.confidence)">{{ Math.round(inv.confidence * 100) }}%</span>
+                </div>
+              </td>
+              <td class="px-4 py-3">
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
+                  [ngClass]="getStatusClass(inv.status)">
+                  {{ getStatusLabel(inv.status) }}
+                </span>
+              </td>
+              <td class="px-4 py-3 text-gray-500 text-xs">{{ formatTimeAgo(inv.processedAt) }}</td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="border-t border-gray-800 mt-8 py-6">
+    <div class="max-w-7xl mx-auto px-6 flex items-center justify-between text-xs text-gray-600">
+      <span>Built with n8n + OpenAI GPT-4o + Google Sheets</span>
+      <span>Gmail/Drive → OpenAI Extraction → Validation → Sheets/Review Queue</span>
+    </div>
+  </footer>
+</div>
