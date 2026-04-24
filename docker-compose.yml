@@ -1,0 +1,13 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docs-dashboard
+    restart: unless-stopped
+    networks:
+      - apps-network
+
+networks:
+  apps-network:
+    external: true
